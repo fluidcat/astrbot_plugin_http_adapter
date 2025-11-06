@@ -1,0 +1,5 @@
+name: HTTP ENDPOINT Adapter
+author: fluidcat
+description: http端点适配器，通过HTTP API调用astrbot能力。
+version: 1.0.0
+repo: https://github.com/fluidcat/astrbot_plugin_http_adapter

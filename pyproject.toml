@@ -1,0 +1,12 @@
+[project]
+name = "astrbot-plugin-restapi-adapter"
+version = "0.1.0"
+description = "REST API adapter for AstrBot with internal queue creation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "astrbot>=4.5.1",
+]
