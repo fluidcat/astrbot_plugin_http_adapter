@@ -68,29 +68,6 @@ class HttpEndpointPlugin(Star):
             if pm.name == 'http_endpoint':
                 await self.context.platform_manager.terminate_platform(pm.id)
 
-    @filter.command("http_test")
-    async def openurl(self, event: AstrMessageEvent):
-        yield event.plain_result("这是第1条回复")
-        await asyncio.sleep(0.5)
-        yield event.plain_result("这是第2条回复")
-        await asyncio.sleep(0.5)
-        yield event.plain_result("这是第3条回复")
-
-    @filter.custom_filter(HttpEndpointAdapterFilter, priority=10)
-    async def http_monitor(self, event: AstrMessageEvent):
-        msg_id = event.message_obj.message_id
-        logger.info(f"开始处理http_endpoint消息[{msg_id}].....")
-        yield
-        logger.info(f"处理结束http_endpoint消息[{msg_id}].....")
-
-    @filter.on_decorating_result()
-    async def on_decorating_result(self, event: AstrMessageEvent):
-        logger.info('发送消息前on_decorating_result')
-
-    @filter.after_message_sent()
-    async def after_message_sent(self, event: AstrMessageEvent):
-        logger.info('发送消息后after_message_sent')
-
 
 def load_rest_api_modules(hot_reload: bool = True):
     """
