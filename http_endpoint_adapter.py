@@ -1,7 +1,9 @@
 import asyncio
 import secrets
 import string
-from typing import Optional
+from collections.abc import Awaitable
+from typing import Optional, Any
+from cachetools import TTLCache
 
 import jwt
 from jwt.exceptions import (
@@ -22,6 +24,8 @@ from astrbot.api.platform import (
     MessageType,
 )
 from astrbot.core import astrbot_config
+from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.platform.message_session import MessageSesion
 
 from . import api_plugin_context
 from .http_endpoint_event import HttpEndpointPlatformEvent
@@ -55,12 +59,22 @@ def _inject_astrbot_field_metadata():
             "api_key": {
                 "description": "API密钥",
                 "type": "string",
-                "hint": "用于API认证的密钥，自动生成，清空会自动生成新的",
+                "hint": "用于API认证的密钥，自动生成，不建议修改",
             },
             "seek": {
                 "description": "seek",
                 "type": "string",
-                "hint": "seek，自动生成，清空会自动生成新的",
+                "hint": "seek，自动生成，清空会自动生成并重置api_key",
+            },
+            "cache_size": {
+                "description": "请求响应缓存大小",
+                "type": "string",
+                "hint": "接口响应缓存，在高并发场景下缓存过小会导致缓存数据提前过期",
+            },
+            "cache_ttl": {
+                "description": "响应缓存有效时间",
+                "type": "string",
+                "hint": "单位：秒",
             },
         }
 
@@ -97,6 +111,8 @@ def _inject_astrbot_field_metadata():
         "hint": "HTTP ENDPOINT适配器：通过HTTP API接收和发送消息。",
         "api_endpoint": "/v1/chat",
         "api_key": "",
+        "cache_size": "4096",
+        "cache_ttl": "10",
         "seek": "",
     },
     adapter_display_name="HTTP ENDPOINT",
@@ -123,9 +139,12 @@ class HttpEndpointAdapter(Platform):
         self.api_endpoint = platform_config.get("api_endpoint")
         self.api_key = platform_config.get("api_key")
         self.seek = platform_config.get("seek")
+        self.cache_size = platform_config.get("cache_size")
+        self.cache_ttl = platform_config.get("cache_ttl")
 
         # 存储待处理的HTTP请求
         self._pending_requests = {}
+        self.cache_responses = TTLCache(maxsize=int(self.cache_size), ttl=int(self.cache_ttl))
 
         self._running = False
         self.future = asyncio.Future()
@@ -180,7 +199,10 @@ class HttpEndpointAdapter(Platform):
             message = self.convert_message(request_data)
             # 请求ID
             msg_id = message.message_id
-            if self._pending_requests.get('msg_id'):
+            if resp := self.cache_responses.get(msg_id):
+                return jsonify({"msg_id": msg_id, "data": resp}), 200
+
+            if self._pending_requests.get(msg_id):
                 return jsonify({"error": f"message：{msg_id} 正在处理中"}), 409
 
             # 创建Future对象用于存储响应
@@ -196,17 +218,17 @@ class HttpEndpointAdapter(Platform):
             # 等待响应
             try:
                 # 设置超时时间，避免无限等待
-                response_data = await asyncio.wait_for(response_future, timeout=30.0)
+                await asyncio.wait_for(response_future, timeout=30.0)
 
                 # 清理Future
                 if msg_id in self._pending_requests:
                     del self._pending_requests[msg_id]
 
                 # 返回响应数据
-                if isinstance(response_data, dict):
-                    return jsonify(response_data), 200
+                if resp := self.cache_responses.get(msg_id):
+                    return jsonify({"msg_id": msg_id, "data": resp}), 200
                 else:
-                    return str(response_data), 200
+                    return jsonify({"msg_id": msg_id, "data": []}), 200
             except asyncio.TimeoutError:
                 # 清理超时的Future
                 if msg_id in self._pending_requests:
@@ -313,18 +335,65 @@ class HttpEndpointAdapter(Platform):
         astrbot_config.save_config()
         # todo 卸载加载adapter模块、隐藏消息平台中的adapter实例
 
-    async def response_to(self, message_data: dict):
+    async def send_by_session(
+        self,
+        session: MessageSesion,
+        message_chain: MessageChain,
+    ) -> Awaitable[Any]:
+        """
+        先缓存数据，等待客户端请求时，一起返回
+        """
+        contents = self.extract_message(message_chain)
+        if contents:
+            return None
+        session_id = f'session:{session.session_id}'
+        _cache = self.cache_responses.get(session_id, [])
+        _cache.extend(contents)
+        self.cache_responses.update({session_id: _cache})
+
+    async def response_to(self, req_msg: AstrBotMessage, message: MessageChain):
         """将消息发送到HTTP ENDPOINT"""
+        msg_id = req_msg.message_id
+
         try:
-            msg_id = message_data.get('msg_id')
+            session_content = []
+            # 添加会话级的主动数据
+            session_id = f'session:{req_msg.session_id}'
+            if session_msg := self.cache_responses.get(session_id, []):
+                session_content.extend(session_msg)
+
+            # 添加请求级别被动数据
+            content = self.extract_message(message)
+            _cache = self.cache_responses.get(msg_id, [])
+            _cache.extend(session_content)
+            _cache.extend(content)
+            self.cache_responses.update({msg_id: _cache})
 
             if msg_id and msg_id in self._pending_requests:
                 response_future = self._pending_requests[msg_id]
                 if not response_future.done():
-                    response_future.set_result(message_data)
-                logger.info(f"http_endpoint 发送响应到 {msg_id}: {message_data}")
+                    response_future.set_result(content)
+            logger.info(f"http_endpoint 缓存响应到 {msg_id}: {content}")
         except Exception as e:
             logger.error(f"发送消息到API失败: {e}")
+
+    def extract_message(self, message: MessageChain):
+        content = []
+        chain = message.chain
+        for item in chain:
+            if isinstance(item, Plain):
+                content.append({"item_id": self.generate_id(length=10), "type": "text", "content": item.text})
+            elif isinstance(item, Image):
+                if hasattr(item, "url") and item.url:
+                    content.append({"item_id": self.generate_id(length=10), "type": "image", "content": item.url})
+                elif hasattr(item, "path") and item.path:
+                    # todo 本地图片转url
+                    logger.warning("暂不支持发送本地图片文件")
+                else:
+                    logger.warning("图片消息缺少URL或路径信息")
+            else:
+                logger.warning(f"忽略不支持的消息组件: {item.__class__.__name__}")
+        return content
 
     def generate_id(self, length=8):
         chars = string.ascii_letters + string.digits
@@ -367,7 +436,7 @@ class HttpEndpointAdapter(Platform):
         token = jwt.encode(payload, jwt_token, algorithm="HS256")
         return token
 
-    def token_check(self, auth_header:str):
+    def token_check(self, auth_header: str):
         # 1. 提取 Authorization 请求头
         if not auth_header:
             raise ValueError("Authorization 请求头缺失")

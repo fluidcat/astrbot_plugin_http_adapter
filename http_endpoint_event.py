@@ -48,30 +48,7 @@ class HttpEndpointPlatformEvent(AstrMessageEvent):
 
     async def send(self, message: MessageChain):
         """发送消息到HTTP ENDPOINT：
-        - 合并连续的文本段为单条消息
-        - 图片作为URL发送
         """
-        # 获取消息ID用于回复
-        msg_id = self.message_obj.message_id
-
-        resp = []
-        response_body = {"msg_id": msg_id, 'data': resp}
-
-        # 核心修复：确保在遍历前获取可迭代列表
-        chain = message.chain
-        for item in chain:
-            if isinstance(item, Plain):
-                resp.append({"type": "text", "content": item.text})
-            elif isinstance(item, Image):
-                if hasattr(item, "url") and item.url:
-                    resp.append({"type": "image", "content": item.url})
-                elif hasattr(item, "path") and item.path:
-                    # todo 本地图片转url
-                    logger.warning("暂不支持发送本地图片文件")
-                else:
-                    logger.warning("图片消息缺少URL或路径信息")
-            else:
-                logger.warning(f"忽略不支持的消息组件: {item.__class__.__name__}")
         await super().send(message)
-        await self.adapter.response_to(response_body)
+        await self.adapter.response_to(self.message_obj, message)
 
