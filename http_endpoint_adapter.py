@@ -4,6 +4,12 @@ import string
 from typing import Optional
 
 import jwt
+from jwt.exceptions import (
+    InvalidTokenError,
+    DecodeError,
+    ExpiredSignatureError,
+    InvalidSignatureError
+)
 
 from astrbot.api import logger
 from astrbot.api.message_components import Image, Plain
@@ -49,8 +55,13 @@ def _inject_astrbot_field_metadata():
             "api_key": {
                 "description": "API密钥",
                 "type": "string",
-                "hint": "用于API认证的密钥，自动生成",
-            }
+                "hint": "用于API认证的密钥，自动生成，清空会自动生成新的",
+            },
+            "seek": {
+                "description": "seek",
+                "type": "string",
+                "hint": "seek，自动生成，清空会自动生成新的",
+            },
         }
 
         # 仅在缺失时新增；若已存在则尽量补齐缺失的字段
@@ -86,6 +97,7 @@ def _inject_astrbot_field_metadata():
         "hint": "HTTP ENDPOINT适配器：通过HTTP API接收和发送消息。",
         "api_endpoint": "/v1/chat",
         "api_key": "",
+        "seek": "",
     },
     adapter_display_name="HTTP ENDPOINT",
 )
@@ -110,6 +122,7 @@ class HttpEndpointAdapter(Platform):
         self.settings = platform_settings
         self.api_endpoint = platform_config.get("api_endpoint")
         self.api_key = platform_config.get("api_key")
+        self.seek = platform_config.get("seek")
 
         # 存储待处理的HTTP请求
         self._pending_requests = {}
@@ -126,7 +139,15 @@ class HttpEndpointAdapter(Platform):
                 break
 
     def api_register(self):
-        # 确保上下文已正确设置
+        if not self.seek:
+            self.api_key = None
+            self.seek = self.generate_id(length=16)
+            self.platform_config.update({"seek": self.seek})
+            astrbot_config.save_config()
+        if not self.api_key:
+            self.api_key = self.generate_jwt()
+            self.platform_config.update({"api_key": self.api_key})
+            astrbot_config.save_config()
         if (hasattr(api_plugin_context, 'plugin_context') and
                 api_plugin_context.plugin_context and
                 hasattr(api_plugin_context.plugin_context, 'register_web_api')):
@@ -136,13 +157,17 @@ class HttpEndpointAdapter(Platform):
                 methods=["POST"],
                 desc="HTTP ENDPOINT 接收消息"
             )
-        if not self.api_key:
-            api_key = self.generate_jwt(self.api_endpoint)
-            self.platform_config.update({"api_key": api_key})
-            astrbot_config.save_config()
 
     async def receive_http_request(self):
         from quart import request, jsonify
+        # 检查token是否有效
+        try:
+            auth_header = request.headers.get("Authorization")
+            self.token_check(auth_header)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 401
+        except Exception as e:
+            return jsonify({"error": "Invalid Authorization"}), 401
 
         try:
             # 获取请求数据
@@ -152,18 +177,18 @@ class HttpEndpointAdapter(Platform):
             if not request_data:
                 return jsonify({"error": "Invalid JSON data"}), 400
 
-            # 为请求生成唯一ID
-            request_id = str(self.generate_id())
-            request_data['request_id'] = request_id
+            message = self.convert_message(request_data)
+            # 请求ID
+            msg_id = message.message_id
+            if self._pending_requests.get('msg_id'):
+                return jsonify({"error": f"message：{msg_id} 正在处理中"}), 409
 
             # 创建Future对象用于存储响应
             response_future = asyncio.Future()
 
             # 将请求ID和Future存储在适配器中
-            self._pending_requests[request_id] = response_future
+            self._pending_requests[msg_id] = response_future
 
-            # 直接处理消息而不是放入队列
-            message = self.convert_message(request_data)
             if message:
                 # 直接处理消息
                 await self.handle_msg(message)
@@ -174,8 +199,8 @@ class HttpEndpointAdapter(Platform):
                 response_data = await asyncio.wait_for(response_future, timeout=30.0)
 
                 # 清理Future
-                if request_id in self._pending_requests:
-                    del self._pending_requests[request_id]
+                if msg_id in self._pending_requests:
+                    del self._pending_requests[msg_id]
 
                 # 返回响应数据
                 if isinstance(response_data, dict):
@@ -184,8 +209,8 @@ class HttpEndpointAdapter(Platform):
                     return str(response_data), 200
             except asyncio.TimeoutError:
                 # 清理超时的Future
-                if request_id in self._pending_requests:
-                    del self._pending_requests[request_id]
+                if msg_id in self._pending_requests:
+                    del self._pending_requests[msg_id]
                 return jsonify({"error": "Response timeout"}), 504
 
         except Exception as e:
@@ -223,7 +248,6 @@ class HttpEndpointAdapter(Platform):
     def convert_message(self, data: dict) -> Optional[AstrBotMessage]:
         """将API消息转换为 AstrBotMessage"""
         try:
-            request_id = data.get('request_id', self.generate_id())
             msg_id = data.get('msg_id', self.generate_id())
             query = data.get('query', '')
             msg_type = data.get('type', '')
@@ -239,10 +263,9 @@ class HttpEndpointAdapter(Platform):
             abm.raw_message = data
             abm.message_id = msg_id
             abm.session_id = sender_id
-            abm.self_id = sender_id
+            abm.self_id = 'http_endpoint_self_007'  # 机器人id固定
             # 处理消息类型
             abm.type = MessageType.FRIEND_MESSAGE
-            abm.request_id = request_id
 
             # 消息类型：text、image、audio
             if msg_type == "text":
@@ -266,10 +289,7 @@ class HttpEndpointAdapter(Platform):
         """处理接收到的消息"""
         if not message:
             return
-
         try:
-
-
             event = HttpEndpointPlatformEvent(
                 message_str=message.message_str,
                 message_obj=message,
@@ -296,13 +316,13 @@ class HttpEndpointAdapter(Platform):
     async def response_to(self, message_data: dict):
         """将消息发送到HTTP ENDPOINT"""
         try:
-            request_id = message_data.get('request_id')
+            msg_id = message_data.get('msg_id')
 
-            if request_id and request_id in self._pending_requests:
-                response_future = self._pending_requests[request_id]
+            if msg_id and msg_id in self._pending_requests:
+                response_future = self._pending_requests[msg_id]
                 if not response_future.done():
                     response_future.set_result(message_data)
-                logger.info(f"发送rest响应到 {request_id}: {message_data}")
+                logger.info(f"http_endpoint 发送响应到 {msg_id}: {message_data}")
         except Exception as e:
             logger.error(f"发送消息到API失败: {e}")
 
@@ -336,16 +356,45 @@ class HttpEndpointAdapter(Platform):
                 empty_hints.append(f"{field_name}不能为空")
         return empty_hints
 
-    def generate_jwt(self, username):
+    def generate_jwt(self):
         payload = {
-            "username": username,
-            # "exp": datetime.datetime.utcnow() + datetime.timedelta(days=7),
+            "username": self.api_endpoint,
+            "seek": self.seek,
         }
         jwt_token = astrbot_config.get('dashboard', {}).get('jwt_secret', '')
         if not jwt_token:
             raise ValueError("JWT secret is not set in the cmd_config.")
         token = jwt.encode(payload, jwt_token, algorithm="HS256")
         return token
+
+    def token_check(self, auth_header:str):
+        # 1. 提取 Authorization 请求头
+        if not auth_header:
+            raise ValueError("Authorization 请求头缺失")
+
+        # 2. 拆分 Bearer 前缀（格式必须是 "Bearer <token>"）
+        auth_parts = auth_header.split()
+        if len(auth_parts) != 2 or auth_parts[0].lower() != "bearer":
+            raise ValueError("Authorization 格式错误，需为 Bearer <token>")
+
+        # 3. 获取 JWT 令牌字符串
+        jwt_token = auth_parts[1]
+        if not jwt_token:
+            raise ValueError("JWT 令牌为空")
+
+        try:
+            jwt_secret = astrbot_config.get('dashboard', {}).get('jwt_secret', '')
+            payload = jwt.decode(jwt=jwt_token, key=jwt_secret, algorithms=["HS256"])
+            if self.seek != payload['seek']:
+                raise ValueError("JWT 令牌已失效")
+        except ExpiredSignatureError:
+            raise ValueError("JWT 令牌已过期")
+        except InvalidSignatureError:
+            raise ValueError("JWT 签名无效（密钥错误或令牌被篡改）")
+        except DecodeError:
+            raise ValueError("JWT 格式错误，无法解码")
+        except InvalidTokenError:
+            raise ValueError("无效的 JWT 令牌")
 
     def _validate_config(self, config: dict):
         """验证配置参数"""

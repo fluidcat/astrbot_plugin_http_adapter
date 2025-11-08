@@ -52,10 +52,10 @@ class HttpEndpointPlatformEvent(AstrMessageEvent):
         - 图片作为URL发送
         """
         # 获取消息ID用于回复
-        request_id = getattr(self.message_obj, "request_id", None)
+        msg_id = self.message_obj.message_id
 
         resp = []
-        response_body = {"request_id": request_id, 'data': resp}
+        response_body = {"msg_id": msg_id, 'data': resp}
 
         # 核心修复：确保在遍历前获取可迭代列表
         chain = message.chain
