@@ -277,7 +277,7 @@ class HttpEndpointAdapter(Platform):
             sender_id = data.get('sender_id', '')
             sender_nickname = data.get('sender_nickname', '')
 
-            hints = self.empty_check({'query': query, 'type': type, 'sender_id': sender_id})
+            hints = self.empty_check({'query': query, 'type': msg_type, 'sender_id': sender_id})
             if hints:
                 raise Exception(hints)
 
@@ -344,7 +344,7 @@ class HttpEndpointAdapter(Platform):
         先缓存数据，等待客户端请求时，一起返回
         """
         contents = self.extract_message(message_chain)
-        if contents:
+        if not contents:
             return None
         session_id = f'session:{session.session_id}'
         _cache = self.cache_responses.get(session_id, [])
