@@ -59,7 +59,7 @@ def _inject_astrbot_field_metadata():
             "api_key": {
                 "description": "API密钥",
                 "type": "string",
-                "hint": "用于API认证的密钥，自动生成，不建议修改",
+                "hint": "用于API认证的密钥，只读不可修改，需要更新请【清空或修改seek】",
             },
             "seek": {
                 "description": "seek",
@@ -163,6 +163,12 @@ class HttpEndpointAdapter(Platform):
             self.seek = self.generate_id(length=16)
             self.platform_config.update({"seek": self.seek})
             astrbot_config.save_config()
+        elif self.api_key:
+            try:
+                # 验证seek是否被修改
+                self.token_check(self.api_key)
+            except:
+                self.api_key = None
         if not self.api_key:
             self.api_key = self.generate_jwt()
             self.platform_config.update({"api_key": self.api_key})

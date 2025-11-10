@@ -10,7 +10,9 @@
 - 支持文本和图片消息类型
 - 自动注册 API 端点
 - JWT Token 认证保护
-- 响应缓存机制
+- 响应缓存机制：缓存astrbot发送的消息
+  - http与im消息平台最大区别在于，im是双向通讯，astrbot每次处理im消息都支持多次发消息到im，以及发送主动消息给im，短连接的http下客户端只能通过轮训才能确保获得全部消息
+  - 如果使用http长连接或者websocket，就不是HTTP API了
 - 响应数据包含[item_id](file://d:\develop\python\astrbot_plugin_http_adapter\http_endpoint_adapter.py#L285-L285)字段，支持去重
 
 ## 安装方式
@@ -35,8 +37,9 @@ platform:
     type: "http_endpoint"
     enable: true
     api_endpoint: "/v1/chat"        # API 端点路径
-    api_key: ""                     # API 认证密钥（自动生成）
-    cache_size: "4096"              # 响应缓存大小
+    api_key: ""                     # API 认证密钥（自动生成），只读不可修改，需要更新请 清空或修改seek
+    seek: ""                        # 用于生成api_key（自动生成），清空会自动生成并重置api_key
+    cache_size: "4096"              # 响应缓存大小，通过msg_id标记每个请求，并通过msg_id缓存响应数据
     cache_ttl: "10"                 # 缓存有效时间（秒）
 ```
 
@@ -54,16 +57,20 @@ platform:
 
 ```json
 {
+  "msg_id": "abcd1234",
   "query": "你好",
   "type": "text",
   "sender_id": "user123",
   "sender_nickname": "用户昵称"
 }
 ```
+> msg_id: 标记每个请求
+> sender_id: 用户id、会话id
 
 图片消息：
 ```json
 {
+  "msg_id": "abcd1234",
   "type": "image",
   "url": "https://example.com/image.jpg",
   "sender_id": "user123",
@@ -84,9 +91,12 @@ AstrBot 处理后会返回响应，每个数据项包含[item_id](file://d:\deve
       "item_id": "1nA8KzIyiY"
     }
   ],
-  "request_id": "abcd1234"
+  "msg_id": "abcd1234"
 }
 ```
+> msg_id: 标记每个请求，与请求时保持一致
+> data: astrbot 可能多次发送的消息
+> item_id: astrbot每次发送消息的id，不会变
 
 ## 技术架构
 
