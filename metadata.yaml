@@ -1,5 +1,5 @@
 name: astrbot_plugin_http_adapter
 author: fluidcat
 description: 获得使用http接口调用astrbot的能力
-version: 1.1.0
+version: 1.1.1
 repo: https://github.com/fluidcat/astrbot_plugin_http_adapter

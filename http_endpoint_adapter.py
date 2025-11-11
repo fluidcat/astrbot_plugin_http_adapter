@@ -1,9 +1,13 @@
 import asyncio
+import json
 import secrets
 import string
+import time
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
+import datetime
 from typing import Optional, Any
+from quart import request, jsonify, g, has_request_context
 
 import aiohttp
 import jwt
@@ -63,6 +67,11 @@ def _inject_astrbot_field_metadata():
                 "type": "string",
                 "hint": "用于API认证的密钥，只读不可修改，需要更新请【清空或修改seek】",
             },
+            "hep_api_key_ttl": {
+                "description": "API密钥有效期",
+                "type": "string",
+                "hint": "API密钥有效期，默认有效期7天(604800秒)",
+            },
             "hep_seek": {
                 "description": "seek",
                 "type": "string",
@@ -109,7 +118,12 @@ class RespMsg:
     data: list[dict] = field(default_factory=list)
     detail: Optional[str] = "success"
     code: int = 0
-    
+    api_key_ttl: int = 0
+
+    def __init__(self):
+        if has_request_context():
+            self.api_key_ttl = g.hep_api_key_ttl
+
     def build(self, msg_id: str = "", data: list = [], detail: str = "success", code: int = 0) -> "RespMsg":
         self.msg_id = msg_id
         self.data = data
@@ -121,12 +135,17 @@ class RespMsg:
         self.msg_id = msg_id
         self.data = data
         return self
-    
-    def error(self, detail, msg_id: str="", code: int = 500) -> "RespMsg":
+
+    def error(self, detail, msg_id: str = "", code: int = 500) -> "RespMsg":
         self.msg_id = msg_id
         self.detail = detail
         self.code = code
         return self
+
+    def key_ttl(self, ttl: int):
+        self.api_key_ttl = ttl
+        return self
+
 
 @register_platform_adapter(
     "http_endpoint",
@@ -138,7 +157,7 @@ class RespMsg:
         "hint": "HTTP ENDPOINT适配器：通过HTTP API接收和发送消息。",
         "hep_api_endpoint": "/v1/chat",
         "hep_api_key": "",
-        "hep_seek": "",
+        "hep_api_key_ttl": str(7 * 24 * 60 * 60),
         "hep_callback_switch": False,
         "hep_callback_url": "",
         "hep_cache_size": "4096",
@@ -164,7 +183,7 @@ class HttpEndpointAdapter(Platform):
         self.settings = platform_settings
         self.api_endpoint = platform_config.get("hep_api_endpoint", "/v1/chat")
         self.api_key = platform_config.get("hep_api_key", "")
-        self.seek = platform_config.get("hep_seek", "")
+        self.api_key_ttl = platform_config.get("hep_api_key_ttl", "7")
 
         self.cache_size = platform_config.get("hep_cache_size", "4096")
         self.cache_ttl = platform_config.get("hep_cache_ttl", "300")
@@ -182,7 +201,9 @@ class HttpEndpointAdapter(Platform):
 
         self._running = False
         self.future = asyncio.Future()
-        logger.info("HTTP ENDPOINT Adapter 初始化完成。")
+
+        self.init_api_key()
+        logger.debug("HTTP ENDPOINT Adapter 初始化完成。")
 
     def api_terminate(self):
         apis = api_plugin_context.plugin_context.registered_web_apis
@@ -192,21 +213,6 @@ class HttpEndpointAdapter(Platform):
                 break
 
     def api_register(self):
-        if not self.seek:
-            self.api_key = None
-            self.seek = self.generate_id(length=16)
-            self.platform_config.update({"hep_seek": self.seek})
-            astrbot_config.save_config()
-        elif self.api_key:
-            try:
-                # 验证seek是否被修改
-                self.token_check(self.api_key)
-            except:
-                self.api_key = None
-        if not self.api_key:
-            self.api_key = self.generate_jwt()
-            self.platform_config.update({"hep_api_key": self.api_key})
-            astrbot_config.save_config()
         if (hasattr(api_plugin_context, 'plugin_context') and
                 api_plugin_context.plugin_context and
                 hasattr(api_plugin_context.plugin_context, 'register_web_api')):
@@ -216,13 +222,18 @@ class HttpEndpointAdapter(Platform):
                 methods=["POST"],
                 desc="HTTP ENDPOINT 接收消息"
             )
+            api_plugin_context.plugin_context.register_web_api(
+                route="/hep/refresh_token",
+                view_handler=self.async_refresh_api_key,
+                methods=["POST", "GET"],
+                desc="HTTP ENDPOINT 刷新api_key"
+            )
 
     async def receive_http_request(self):
-        from quart import request, jsonify
         # 检查token是否有效
         try:
             auth_header = request.headers.get("Authorization", "")
-            self.token_check(auth_header)
+            self.verify_api_key(auth_header)
         except Exception as e:
             return jsonify(RespMsg().error(detail="Invalid Authorization", code=401)), 401
 
@@ -282,6 +293,29 @@ class HttpEndpointAdapter(Platform):
             logger.error(f"处理HTTP请求时出错: {e}", exc_info=True)
             return jsonify(RespMsg().error(detail=f"Internal server error: {str(e)}", code=500)), 500
 
+    def init_api_key(self):
+        try:
+            # 验证api_key是否可用
+            payload = self.verify_api_key(self.api_key)
+            if self.api_key_ttl != payload.get("ttl", ""):
+                raise Exception("api_key_ttl change error")
+        except:
+            self.refresh_api_key()
+
+    async def async_refresh_api_key(self):
+        msg = self.refresh_api_key()
+        status_code = msg.code if msg.code else 200
+        return jsonify(msg), status_code
+
+    def refresh_api_key(self):
+        try:
+            self.api_key = self.generate_jwt()
+            self.platform_config.update({"hep_api_key": self.api_key})
+            astrbot_config.save_config()
+            return RespMsg().build(data=self.api_key)
+        except:
+            return RespMsg().error(detail="refresh_token error", code=500)
+
     def meta(self) -> "PlatformMetadata":
         return PlatformMetadata(
             name="http_endpoint",
@@ -291,19 +325,23 @@ class HttpEndpointAdapter(Platform):
         )
 
     async def run(self):
+        logger.info("HTTP ENDPOINT Adapter 正在启动...")
         if self.future.done():
             self.future = asyncio.Future()
         else:
             self.future.cancel("重新启动")
             self.future = asyncio.Future()
 
-        logger.info("HTTP ENDPOINT Adapter 正在启动...")
+        self.init_api_key()
         self.api_register()
         self._running = True
         # 启动回调队列
         if self.callback_switch:
             await self.callback_queue.start()
+            if not self.callback_url:
+                logger.warning("HTTP ENDPOINT 已开启 callback回调 但未配置 callback_url，回调推送将不可用")
 
+        logger.info("HTTP ENDPOINT Adapter 启动成功")
         try:
             await self.future
         except asyncio.CancelledError as e:
@@ -432,7 +470,7 @@ class HttpEndpointAdapter(Platform):
                 del self._pending_requests[msg_id]
                 if not response_future.done():
                     response_future.set_result(reqrep_content)
-            logger.info(f"http_endpoint 缓存响应到 {msg_id}: {reqrep_content}")
+            logger.debug(f"http_endpoint 缓存响应到 {msg_id}: {reqrep_content}")
 
         except Exception as e:
             logger.error(f"发送消息到API失败: {e}")
@@ -443,14 +481,15 @@ class HttpEndpointAdapter(Platform):
             await self.callback_queue.put(RespMsg().ok(msg_id, data))
 
     async def callback_handler(self, msg: RespMsg):
-        logger.debug(f"callback_handler: {msg}")
+        logger.debug(f"推送到: {self.callback_url} ,body: {json.dumps(msg.__dict__, ensure_ascii=False)}")
         if not self.callback_url:
             logger.error("callback_url 为空，无法发送回调")
             return
+        headers = {"Content-Type": "application/json"}
         for attempt in range(1, 3):
             try:
                 async with self.callback_session.post(
-                        self.callback_url, json=msg.__dict__, timeout=ClientTimeout(total=10)) as resp:
+                        self.callback_url, json=msg.__dict__, timeout=ClientTimeout(total=10), headers=headers) as resp:
                     resp.raise_for_status()
                 return
             except Exception as e:
@@ -507,7 +546,8 @@ class HttpEndpointAdapter(Platform):
     def generate_jwt(self):
         payload = {
             "username": self.api_endpoint,
-            "seek": self.seek,
+            "ttl": self.api_key_ttl,
+            "exp": datetime.datetime.utcnow() + datetime.timedelta(seconds=int(self.api_key_ttl))
         }
         jwt_token = astrbot_config.get('dashboard', {}).get('jwt_secret', '')
         if not jwt_token:
@@ -515,26 +555,26 @@ class HttpEndpointAdapter(Platform):
         token = jwt.encode(payload, jwt_token, algorithm="HS256")
         return token
 
-    def token_check(self, auth_header: str):
+    def verify_api_key(self, raw_api_key: str):
         # 1. 提取 Authorization 请求头
-        if not auth_header:
+        if not raw_api_key:
             raise ValueError("Authorization 请求头缺失")
 
         # 2. 拆分 Bearer 前缀（格式必须是 "Bearer <token>"）
-        auth_parts = auth_header.split()
-        if len(auth_parts) != 2 or auth_parts[0].lower() != "bearer":
-            raise ValueError("Authorization 格式错误，需为 Bearer <token>")
+        jwt_token = raw_api_key
+        if raw_api_key.lower().startswith("bearer"):
+            auth_parts = raw_api_key.split()
+            jwt_token = auth_parts[1]
 
-        # 3. 获取 JWT 令牌字符串
-        jwt_token = auth_parts[1]
         if not jwt_token:
             raise ValueError("JWT 令牌为空")
 
         try:
             jwt_secret = astrbot_config.get('dashboard', {}).get('jwt_secret', '')
             payload = jwt.decode(jwt=jwt_token, key=jwt_secret, algorithms=["HS256"])
-            if self.seek != payload['seek']:
-                raise ValueError("JWT 令牌已失效")
+            if has_request_context():
+                g.hep_api_key_ttl = int(payload.get("exp")) - int(time.time())
+
         except ExpiredSignatureError:
             raise ValueError("JWT 令牌已过期")
         except InvalidSignatureError:
@@ -543,4 +583,3 @@ class HttpEndpointAdapter(Platform):
             raise ValueError("JWT 格式错误，无法解码")
         except InvalidTokenError:
             raise ValueError("无效的 JWT 令牌")
-

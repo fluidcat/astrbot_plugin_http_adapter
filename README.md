@@ -2,32 +2,9 @@
 
 为 [AstrBot](https://github.com/Soulter/AstrBot) 设计的 HTTP ENDPOINT 适配器插件，通过 HTTP API 实现与外部系统的双向消息集成。
 
----
+## 使用说明
 
-## 功能特性
-
-- 通过 HTTP API 接收和发送消息
-- 支持文本和图片消息类型
-- 自动注册 API 端点
-- JWT Token 认证保护
-- 响应缓存机制：缓存astrbot发送的消息
-  - http与im消息平台最大区别在于，im是双向通讯，astrbot每次处理im消息都支持多次发消息到im，以及发送主动消息给im，短连接的http下客户端只能通过轮训才能确保获得全部消息
-  - 如果使用http长连接或者websocket，就不是HTTP API了
-- 响应数据包含[item_id](file://d:\develop\python\astrbot_plugin_http_adapter\http_endpoint_adapter.py#L285-L285)字段，支持去重
-
-## 安装方式
-
-### 方法一：通过插件管理器安装（推荐）
-
-1. 在 AstrBot 管理界面中进入插件管理
-2. 选择"安装插件"，上传本插件的 ZIP 包
-
-### 方法二：手动安装
-
-1. 克隆或下载本仓库到 AstrBot 的 plugins 目录
-2. 在 AstrBot 配置文件中启用插件
-
-## 配置说明
+### 配置参数
 
 在 AstrBot 的配置文件中添加以下配置项：
 
@@ -36,25 +13,69 @@ platform:
   - id: "http_endpoint"
     type: "http_endpoint"
     enable: true
-    api_endpoint: "/v1/chat"        # API 端点路径
-    api_key: ""                     # API 认证密钥（自动生成），只读不可修改，需要更新请 清空或修改seek
-    seek: ""                        # 用于生成api_key（自动生成），清空会自动生成并重置api_key
-    cache_size: "4096"              # 响应缓存大小，通过msg_id标记每个请求，并通过msg_id缓存响应数据
-    cache_ttl: "10"                 # 缓存有效时间（秒）
+    hep_api_endpoint: "/v1/chat"        # API 端点路径
+    hep_api_key: ""                     # API 认证密钥（自动生成）
+    hep_api_key_ttl: "604800"           # API密钥有效期，默认7天(604800秒)
+    hep_callback_switch: false          # 消息回调开关，开启后响应缓存则失效
+    hep_callback_url: ""                # 消息回调URL，消息回调开关开启时必填
+    hep_cache_size: "4096"              # 响应缓存大小
+    hep_cache_ttl: "300"                # 缓存有效时间（秒），默认300秒
 ```
-
-## 使用说明
 
 ### API 调用地址
 
 - 外部系统调用地址：`http://your-host:port/api/plug/[api_endpoint]`
-- 例如：如果 [api_endpoint](file://d:\develop\python\astrbot_plugin_http_adapter\http_endpoint_adapter.py#L135-L135) 配置为 `/v1/chat`，则完整地址为 `http://your-host:port/api/plug/v1/chat`
+- 例如：如果 api_endpoint 配置为 `/v1/chat`，则完整地址为 `http://your-host:port/api/plug/v1/chat`
 - 所有请求需在 Header 中添加认证信息：`Authorization: Bearer [api_key]`
 
-### 接收消息格式
+### 刷新API密钥
+
+在API密钥过期前，可以通过以下端点刷新：
+
+- 需要在过期前使用即将过期的秘钥刷新
+- 刷新密钥地址：`http://your-host:port/api/plug/hep/refresh_token`
+- 请求方法：POST 或 GET
+- 成功后将返回新的API密钥
+
+### 消息通信模式
+
+#### HTTP轮询模式（默认）
+
+当 `hep_callback_switch` 设置为 `false` 时，使用HTTP轮询模式：
+
+- 客户端向API端点发送消息请求
+- AstrBot处理消息并缓存响应数据
+- 客户端通过轮询获取完整响应数据
+- 返回数据包含指定 `msg_id` 对应的全量响应以及AstrBot主动发送的消息
+
+#### HTTP回调模式
+
+当 `hep_callback_switch` 设置为 `true` 时，使用HTTP回调模式：
+
+- AstrBot发送的每个消息都会推送到配置的 `hep_callback_url`, post方法发送json
+- 回调采用POST请求，数据格式与轮询模式下的响应格式一致
+- 回调失败时会重试，最多重试3次，超时时间为10秒
+- 启用回调模式后，响应缓存机制将失效
+
+推送数据样例：
+```json
+{
+  "msg_id": "1233",
+  "data": [
+    {
+      "item_id": "4zchNMkO08",
+      "type": "text",
+      "content": "你好！有什么可以帮助你的吗？"
+    }
+  ]
+}
+```
+
+### 发送消息到AstrBot
 
 向配置的 API 端点发送 POST 请求：
 
+文本消息：
 ```json
 {
   "msg_id": "abcd1234",
@@ -64,8 +85,6 @@ platform:
   "sender_nickname": "用户昵称"
 }
 ```
-> msg_id: 标记每个请求
-> sender_id: 用户id、会话id
 
 图片消息：
 ```json
@@ -78,9 +97,9 @@ platform:
 }
 ```
 
-### 响应消息格式
+### 接收AstrBot的响应
 
-AstrBot 处理后会返回响应，每个数据项包含[item_id](file://d:\develop\python\astrbot_plugin_http_adapter\http_endpoint_adapter.py#L285-L285)字段，可用于去重：
+AstrBot 处理后会返回响应，每个数据项包含 item_id 字段，可用于去重：
 
 ```json
 {
@@ -91,18 +110,26 @@ AstrBot 处理后会返回响应，每个数据项包含[item_id](file://d:\deve
       "item_id": "1nA8KzIyiY"
     }
   ],
+  "detail": "success",
+  "code": 0,
+  "api_key_ttl": 603981,
   "msg_id": "abcd1234"
 }
 ```
+
 > msg_id: 标记每个请求，与请求时保持一致
-> data: astrbot 可能多次发送的消息
-> item_id: astrbot每次发送消息的id，不会变
+> api_key_ttl: 当前请求使用的api_key剩余有效时间，单位：秒
+> detail：请求处理附加信息
+> data: AstrBot 可能多次发送的消息
+> item_id: AstrBot每次发送消息的唯一标识，可用于客户端去重处理
 
-## 技术架构
+### API密钥安全说明
 
-- 使用 `register_web_api` 方法注册 HTTP 端点
-- 通过 Future 机制匹配请求与响应
-- 使用 TTLCache 实现响应数据缓存
+- API密钥首次使用时从消息平台配置中获取
+- API密钥具有有效期，需在过期前通过 `/hep/refresh_token` 端点刷新
+- 如果密钥过期，只能从消息平台配置中重新获取
+- 特别注意：API密钥是AstrBot通用token，拥有与通过Web登录AstrBot相同的权限
+- 如果API密钥泄露，将存在AstrBot安全风险，请妥善保管
 
 ## 依赖要求
 
