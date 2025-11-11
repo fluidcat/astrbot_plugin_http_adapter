@@ -2,10 +2,13 @@ import asyncio
 import secrets
 import string
 from collections.abc import Awaitable
+from dataclasses import dataclass, field
 from typing import Optional, Any
-from cachetools import TTLCache
 
+import aiohttp
 import jwt
+from aiohttp.client import ClientTimeout
+from cachetools import TTLCache
 from jwt.exceptions import (
     InvalidTokenError,
     DecodeError,
@@ -26,7 +29,7 @@ from astrbot.api.platform import (
 from astrbot.core import astrbot_config
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.message_session import MessageSesion
-
+from .component_queue import KeyedSeqQueue
 from . import api_plugin_context
 from .http_endpoint_event import HttpEndpointPlatformEvent
 
@@ -49,29 +52,39 @@ def _inject_astrbot_field_metadata():
             return
 
         adapter_config = {
-            # 核心配置
-            "api_endpoint": {
+            "hep_api_endpoint": {
                 "description": "API端点URL",
                 "type": "string",
                 "hint": "必填项。HTTP ENDPOINT的基地址。",
                 "obvious_hint": True,
             },
-            "api_key": {
+            "hep_api_key": {
                 "description": "API密钥",
                 "type": "string",
                 "hint": "用于API认证的密钥，只读不可修改，需要更新请【清空或修改seek】",
             },
-            "seek": {
+            "hep_seek": {
                 "description": "seek",
                 "type": "string",
                 "hint": "seek，自动生成，清空会自动生成并重置api_key",
             },
-            "cache_size": {
+            "hep_callback_switch": {
+                "description": "消息回调开关",
+                "type": "bool",
+                "hint": "消息回调开关，开启后响应缓存则失效",
+            },
+            "hep_callback_url": {
+                "description": "消息回调URL",
+                "type": "string",
+                "hint": "消息回调开关开启时必填",
+                "obvious_hint": True,
+            },
+            "hep_cache_size": {
                 "description": "请求响应缓存大小",
                 "type": "string",
                 "hint": "接口响应缓存，在高并发场景下缓存过小会导致缓存数据提前过期",
             },
-            "cache_ttl": {
+            "hep_cache_ttl": {
                 "description": "响应缓存有效时间",
                 "type": "string",
                 "hint": "单位：秒",
@@ -80,18 +93,7 @@ def _inject_astrbot_field_metadata():
 
         # 仅在缺失时新增；若已存在则尽量补齐缺失的字段
         for k, v in adapter_config.items():
-            if k not in items:
-                items[k] = v
-            else:
-                it = items[k]
-                if "description" not in it and "description" in v:
-                    it["description"] = v["description"]
-                if "type" not in it and "type" in v:
-                    it["type"] = v["type"]
-                if "hint" not in it and "hint" in v:
-                    it["hint"] = v["hint"]
-                if "obvious_hint" not in it and "obvious_hint" in v:
-                    it["obvious_hint"] = v["obvious_hint"]
+            items[k] = v
 
         logger.debug("已为 HTTP ENDPOINT 适配器注入字段元数据")
     except Exception as e:
@@ -101,6 +103,31 @@ def _inject_astrbot_field_metadata():
             pass
 
 
+@dataclass
+class RespMsg:
+    msg_id: str = ""
+    data: list[dict] = field(default_factory=list)
+    detail: Optional[str] = "success"
+    code: int = 0
+    
+    def build(self, msg_id: str = "", data: list = [], detail: str = "success", code: int = 0) -> "RespMsg":
+        self.msg_id = msg_id
+        self.data = data
+        self.detail = detail
+        self.code = code
+        return self
+
+    def ok(self, msg_id, data) -> "RespMsg":
+        self.msg_id = msg_id
+        self.data = data
+        return self
+    
+    def error(self, detail, msg_id: str="", code: int = 500) -> "RespMsg":
+        self.msg_id = msg_id
+        self.detail = detail
+        self.code = code
+        return self
+
 @register_platform_adapter(
     "http_endpoint",
     "HTTP ENDPOINT Adapter",
@@ -109,11 +136,13 @@ def _inject_astrbot_field_metadata():
         "type": "http_endpoint",
         "enable": False,
         "hint": "HTTP ENDPOINT适配器：通过HTTP API接收和发送消息。",
-        "api_endpoint": "/v1/chat",
-        "api_key": "",
-        "cache_size": "4096",
-        "cache_ttl": "10",
-        "seek": "",
+        "hep_api_endpoint": "/v1/chat",
+        "hep_api_key": "",
+        "hep_seek": "",
+        "hep_callback_switch": False,
+        "hep_callback_url": "",
+        "hep_cache_size": "4096",
+        "hep_cache_ttl": "300",
     },
     adapter_display_name="HTTP ENDPOINT",
 )
@@ -129,22 +158,27 @@ class HttpEndpointAdapter(Platform):
         super().__init__(event_queue)
         self.platform_config = platform_config
         self.platform_settings = platform_settings
-        logger.info("HTTP ENDPOINT Adapter 正在初始化...")
-        # 配置验证
-        self._validate_config(platform_config)
+        logger.debug("HTTP ENDPOINT Adapter 正在初始化...")
 
-        logger.info("HTTP ENDPOINT Adapter 配置验证通过。")
         self.config = platform_config
         self.settings = platform_settings
-        self.api_endpoint = platform_config.get("api_endpoint")
-        self.api_key = platform_config.get("api_key")
-        self.seek = platform_config.get("seek")
-        self.cache_size = platform_config.get("cache_size")
-        self.cache_ttl = platform_config.get("cache_ttl")
+        self.api_endpoint = platform_config.get("hep_api_endpoint", "/v1/chat")
+        self.api_key = platform_config.get("hep_api_key", "")
+        self.seek = platform_config.get("hep_seek", "")
+
+        self.cache_size = platform_config.get("hep_cache_size", "4096")
+        self.cache_ttl = platform_config.get("hep_cache_ttl", "300")
+
+        self.callback_url = platform_config.get("hep_callback_url")
+        self.callback_switch = platform_config.get("hep_callback_switch", False)
+        self.callback_session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=0, limit_per_host=0)
+        )
 
         # 存储待处理的HTTP请求
         self._pending_requests = {}
         self.cache_responses = TTLCache(maxsize=int(self.cache_size), ttl=int(self.cache_ttl))
+        self.callback_queue: KeyedSeqQueue = KeyedSeqQueue(key_func=lambda x: x.msg_id, handler=self.callback_handler)
 
         self._running = False
         self.future = asyncio.Future()
@@ -161,7 +195,7 @@ class HttpEndpointAdapter(Platform):
         if not self.seek:
             self.api_key = None
             self.seek = self.generate_id(length=16)
-            self.platform_config.update({"seek": self.seek})
+            self.platform_config.update({"hep_seek": self.seek})
             astrbot_config.save_config()
         elif self.api_key:
             try:
@@ -171,7 +205,7 @@ class HttpEndpointAdapter(Platform):
                 self.api_key = None
         if not self.api_key:
             self.api_key = self.generate_jwt()
-            self.platform_config.update({"api_key": self.api_key})
+            self.platform_config.update({"hep_api_key": self.api_key})
             astrbot_config.save_config()
         if (hasattr(api_plugin_context, 'plugin_context') and
                 api_plugin_context.plugin_context and
@@ -187,29 +221,28 @@ class HttpEndpointAdapter(Platform):
         from quart import request, jsonify
         # 检查token是否有效
         try:
-            auth_header = request.headers.get("Authorization")
+            auth_header = request.headers.get("Authorization", "")
             self.token_check(auth_header)
-        except ValueError as e:
-            return jsonify({"error": str(e)}), 401
         except Exception as e:
-            return jsonify({"error": "Invalid Authorization"}), 401
+            return jsonify(RespMsg().error(detail="Invalid Authorization", code=401)), 401
 
         try:
             # 获取请求数据
             request_data = await request.get_json()
-
             # 验证请求数据
             if not request_data:
-                return jsonify({"error": "Invalid JSON data"}), 400
+                return jsonify(RespMsg().error(detail="Invalid JSON data", code=400)), 400
 
             message = self.convert_message(request_data)
             # 请求ID
             msg_id = message.message_id
-            if resp := self.cache_responses.get(msg_id):
-                return jsonify({"msg_id": msg_id, "data": resp}), 200
+
+            # 检查缓存，有缓存则直接返回缓存数据
+            if not self.callback_switch and (resp := self.cache_responses.get(msg_id)):
+                return jsonify(RespMsg().ok(msg_id, resp)), 200
 
             if self._pending_requests.get(msg_id):
-                return jsonify({"error": f"message：{msg_id} 正在处理中"}), 409
+                return jsonify(RespMsg().build(msg_id, detail=f"request: {msg_id} 正在处理中")), 202
 
             # 创建Future对象用于存储响应
             response_future = asyncio.Future()
@@ -220,6 +253,9 @@ class HttpEndpointAdapter(Platform):
             if message:
                 # 直接处理消息
                 await self.handle_msg(message)
+
+            if self.callback_switch:
+                return jsonify(RespMsg().ok(msg_id, [])), 200
 
             # 等待响应
             try:
@@ -232,19 +268,19 @@ class HttpEndpointAdapter(Platform):
 
                 # 返回响应数据
                 if resp := self.cache_responses.get(msg_id):
-                    return jsonify({"msg_id": msg_id, "data": resp}), 200
+                    return jsonify(RespMsg().ok(msg_id, resp)), 200
                 else:
-                    return jsonify({"msg_id": msg_id, "data": []}), 200
+                    return jsonify(RespMsg().ok(msg_id, [])), 200
             except asyncio.TimeoutError:
                 # 清理超时的Future
                 if msg_id in self._pending_requests:
                     del self._pending_requests[msg_id]
-                return jsonify({"error": "Response timeout"}), 504
+                return jsonify(RespMsg().build(msg_id, detail=f"request: {msg_id} 正在处理中")), 202
 
         except Exception as e:
             # 记录错误日志
             logger.error(f"处理HTTP请求时出错: {e}", exc_info=True)
-            return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+            return jsonify(RespMsg().error(detail=f"Internal server error: {str(e)}", code=500)), 500
 
     def meta(self) -> "PlatformMetadata":
         return PlatformMetadata(
@@ -264,6 +300,10 @@ class HttpEndpointAdapter(Platform):
         logger.info("HTTP ENDPOINT Adapter 正在启动...")
         self.api_register()
         self._running = True
+        # 启动回调队列
+        if self.callback_switch:
+            await self.callback_queue.start()
+
         try:
             await self.future
         except asyncio.CancelledError as e:
@@ -331,6 +371,7 @@ class HttpEndpointAdapter(Platform):
             logger.error(f"处理消息时出错: {e}")
 
     async def terminate(self):
+        logger.info("HTTP ENDPOINT Adapter 正在清理资源...")
         self._running = False
         # 停止adapter
         self.future.set_result("停止运行")
@@ -339,12 +380,15 @@ class HttpEndpointAdapter(Platform):
         # 同步配置中的停止状态
         self.platform_config.update({"enable": False})
         astrbot_config.save_config()
+
+        await self.callback_queue.shutdown()
+        await self.callback_session.close()
         # todo 卸载加载adapter模块、隐藏消息平台中的adapter实例
 
     async def send_by_session(
-        self,
-        session: MessageSesion,
-        message_chain: MessageChain,
+            self,
+            session: MessageSesion,
+            message_chain: MessageChain,
     ) -> Awaitable[Any]:
         """
         先缓存数据，等待客户端请求时，一起返回
@@ -357,31 +401,60 @@ class HttpEndpointAdapter(Platform):
         _cache.extend(contents)
         self.cache_responses.update({session_id: _cache})
 
+        # 推送到callback队列
+        await self.push_callback_queue(session_id, contents)
+
     async def response_to(self, req_msg: AstrBotMessage, message: MessageChain):
         """将消息发送到HTTP ENDPOINT"""
         msg_id = req_msg.message_id
 
         try:
             session_content = []
-            # 添加会话级的主动数据
+            reqrep_content = self.extract_message(message)
+
+            # 推送到callback队列
+            await self.push_callback_queue(msg_id, reqrep_content)
+
+            # 发送到http缓存
+            ## 添加会话级的主动数据
             session_id = f'session:{req_msg.session_id}'
             if session_msg := self.cache_responses.get(session_id, []):
                 session_content.extend(session_msg)
 
-            # 添加请求级别被动数据
-            content = self.extract_message(message)
+            ## 添加请求级别被动数据
             _cache = self.cache_responses.get(msg_id, [])
             _cache.extend(session_content)
-            _cache.extend(content)
+            _cache.extend(reqrep_content)
             self.cache_responses.update({msg_id: _cache})
 
             if msg_id and msg_id in self._pending_requests:
                 response_future = self._pending_requests[msg_id]
+                del self._pending_requests[msg_id]
                 if not response_future.done():
-                    response_future.set_result(content)
-            logger.info(f"http_endpoint 缓存响应到 {msg_id}: {content}")
+                    response_future.set_result(reqrep_content)
+            logger.info(f"http_endpoint 缓存响应到 {msg_id}: {reqrep_content}")
+
         except Exception as e:
             logger.error(f"发送消息到API失败: {e}")
+
+    async def push_callback_queue(self, msg_id: str, data: list[dict]):
+        """将消息发送到callback队列"""
+        if self.callback_switch and self.callback_url:
+            await self.callback_queue.put(RespMsg().ok(msg_id, data))
+
+    async def callback_handler(self, msg: RespMsg):
+        logger.debug(f"callback_handler: {msg}")
+        if not self.callback_url:
+            logger.error("callback_url 为空，无法发送回调")
+            return
+        for attempt in range(1, 3):
+            try:
+                async with self.callback_session.post(
+                        self.callback_url, json=msg.__dict__, timeout=ClientTimeout(total=10)) as resp:
+                    resp.raise_for_status()
+                return
+            except Exception as e:
+                await asyncio.sleep(2 ** (attempt - 1))
 
     def extract_message(self, message: MessageChain):
         content = []
@@ -471,19 +544,3 @@ class HttpEndpointAdapter(Platform):
         except InvalidTokenError:
             raise ValueError("无效的 JWT 令牌")
 
-    def _validate_config(self, config: dict):
-        """验证配置参数"""
-        # 验证核心必填配置项
-        required_configs = {
-            "api_endpoint": "",
-        }
-
-        for config_key, default_value in required_configs.items():
-            value = config.get(config_key)
-            if not value:
-                logger.critical(
-                    f"HTTP ENDPOINT Adapter 配置不完整，缺少 {config_key}。请检查配置文件。"
-                )
-                raise ValueError(
-                    f"HTTP ENDPOINT Adapter 配置不完整：缺少必需的配置项 {config_key}"
-                )

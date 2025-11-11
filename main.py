@@ -1,14 +1,11 @@
-import asyncio
 import importlib
 import sys
 
-from astrbot.api.star import Context, Star
 from astrbot.api import logger
+from astrbot.api.star import Context, Star
 from astrbot.core import AstrBotConfig
 from astrbot.core.platform import AstrMessageEvent
-from astrbot.api.event import filter
 from astrbot.core.star.filter.custom_filter import CustomFilter
-
 from . import api_plugin_context
 
 HttpEndpointAdapter = None

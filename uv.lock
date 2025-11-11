@@ -291,7 +291,7 @@ wheels = [
 ]
 
 [[package]]
-name = "astrbot-plugin-http-adapter"
+name = "astrbot-plugin-restapi-adapter"
 version = "0.1.0"
 source = { virtual = "." }
 
