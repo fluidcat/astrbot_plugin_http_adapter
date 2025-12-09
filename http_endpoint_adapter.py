@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import secrets
 import string
@@ -168,28 +169,23 @@ class RespMsg:
 class HttpEndpointAdapter(Platform):
     """HTTP ENDPOINT Adapter"""
 
-    def __init__(
-            self,
-            platform_config: dict,
-            platform_settings: dict,
-            event_queue: asyncio.Queue
-    ):
-        super().__init__(event_queue)
-        self.platform_config = platform_config
-        self.platform_settings = platform_settings
+    def __init__(self, config: dict, settings: dict, event_queue: asyncio.Queue):
+        kwargs = {"config": config, "event_queue": event_queue, "settings": settings}
+        super_params = list(inspect.signature(Platform.__init__).parameters.keys())[1:]
+        super_kwargs = {k: v for k, v in kwargs.items() if k in super_params}
+        super().__init__(**super_kwargs)
+        self.platform_settings = settings
         logger.debug("HTTP ENDPOINT Adapter 正在初始化...")
 
-        self.config = platform_config
-        self.settings = platform_settings
-        self.api_endpoint = platform_config.get("hep_api_endpoint", "/v1/chat")
-        self.api_key = platform_config.get("hep_api_key", "")
-        self.api_key_ttl = platform_config.get("hep_api_key_ttl", "7")
+        self.api_endpoint = self.config.get("hep_api_endpoint", "/v1/chat")
+        self.api_key = self.config.get("hep_api_key", "")
+        self.api_key_ttl = self.config.get("hep_api_key_ttl", "7")
 
-        self.cache_size = platform_config.get("hep_cache_size", "4096")
-        self.cache_ttl = platform_config.get("hep_cache_ttl", "300")
+        self.cache_size = self.config.get("hep_cache_size", "4096")
+        self.cache_ttl = self.config.get("hep_cache_ttl", "300")
 
-        self.callback_url = platform_config.get("hep_callback_url")
-        self.callback_switch = platform_config.get("hep_callback_switch", False)
+        self.callback_url = self.config.get("hep_callback_url")
+        self.callback_switch = self.config.get("hep_callback_switch", False)
         self.callback_session = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit=0, limit_per_host=0)
         )
@@ -310,7 +306,7 @@ class HttpEndpointAdapter(Platform):
     def refresh_api_key(self):
         try:
             self.api_key = self.generate_jwt()
-            self.platform_config.update({"hep_api_key": self.api_key})
+            self.config.update({"hep_api_key": self.api_key})
             astrbot_config.save_config()
             return RespMsg().build(data=self.api_key)
         except:
@@ -416,7 +412,7 @@ class HttpEndpointAdapter(Platform):
         # 移除api端点
         self.api_terminate()
         # 同步配置中的停止状态
-        self.platform_config.update({"enable": False})
+        self.config.update({"enable": False})
         astrbot_config.save_config()
 
         await self.callback_queue.shutdown()
